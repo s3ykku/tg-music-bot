@@ -284,6 +284,9 @@ async def process_unsub_art(callback: CallbackQuery):
     subs = load_subs()
     if artist_id in subs["artists"] and user_id in subs["artists"][artist_id]["subscribers"]:
         subs["artists"][artist_id]["subscribers"].remove(user_id)
+        # Если подписчиков больше нет, удаляем артиста из базы
+        if not subs["artists"][artist_id]["subscribers"]:
+            del subs["artists"][artist_id]
         save_subs(subs)
         await callback.answer(f"Вы отписались от {subs['artists'][artist_id]['name']}")
     
@@ -314,6 +317,7 @@ async def check_artist_updates():
                     if latest_track['videoId'] != data['last_release']:
                         # Нашли новый трек!
                         data['last_release'] = latest_track['videoId']
+                        logger.info(f"Новый релиз у {data['name']}: {latest_track['title']}")
                         changed = True
                         
                         notification = (
