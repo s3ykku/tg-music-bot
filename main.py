@@ -2,15 +2,14 @@ import os
 import asyncio
 import logging
 import shutil
+import subprocess
 import re
 import json
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import Command
-from aiogram.types import InlineQueryResultArticle, InputTextMessageContent, FSInputFile, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
-import yt_dlp
+from aiogram.types import InlineQueryResultArticle, InputTextMessageContent, FSInputFile, URLInputFile, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, BotCommand
 from ytmusicapi import YTMusic
 
 # Загрузка переменных из .env
@@ -51,6 +50,14 @@ os.makedirs(TEMP_FOLDER, exist_ok=True)
 # Пул потоков
 executor = ThreadPoolExecutor(max_workers=4)
 
+def fix_thumb_url(url):
+    """Увеличивает качество обложек от Google/YouTube Music."""
+    if not url:
+        return url
+    if "googleusercontent.com" in url or "ggpht.com" in url:
+        return re.sub(r'=[sw]\d+.*$', '=w1200-h1200-l90-rj', url)
+    return url
+
 def search_ytmusic(query, search_type='songs'):
     """
     Ищет треки или альбомы через YouTube Music API.
@@ -58,7 +65,7 @@ def search_ytmusic(query, search_type='songs'):
     """
     try:
         # filter может быть: songs, videos, albums, artists, playlists
-        results = ytmusic.search(query, filter=search_type, limit=10)
+        results = ytmusic.search(query, filter=search_type, limit=20)
         parsed_results = []
         
         for item in results:
@@ -67,7 +74,7 @@ def search_ytmusic(query, search_type='songs'):
                 # Формируем строку артистов (Artist1, Artist2)
                 artists = ", ".join([a['name'] for a in item.get('artists', [])])
                 album = item.get('album', {}).get('name', 'Single')
-                thumb = item['thumbnails'][-1]['url'] if item.get('thumbnails') else None
+                thumb = fix_thumb_url(item['thumbnails'][-1]['url']) if item.get('thumbnails') else None
                 
                 parsed_results.append({
                     'id': item['videoId'],
@@ -81,7 +88,7 @@ def search_ytmusic(query, search_type='songs'):
             elif search_type == 'albums':
                 artists = ", ".join([a['name'] for a in item.get('artists', [])])
                 year = item.get('year', '')
-                thumb = item['thumbnails'][-1]['url'] if item.get('thumbnails') else None
+                thumb = fix_thumb_url(item['thumbnails'][-1]['url']) if item.get('thumbnails') else None
                 
                 # У альбомов ID называется browseId
                 parsed_results.append({
@@ -94,7 +101,7 @@ def search_ytmusic(query, search_type='songs'):
             
             # Обработка АРТИСТОВ
             elif search_type == 'artists':
-                thumb = item['thumbnails'][-1]['url'] if item.get('thumbnails') else None
+                thumb = fix_thumb_url(item['thumbnails'][-1]['url']) if item.get('thumbnails') else None
                 parsed_results.append({
                     'id': item['browseId'],
                     'title': item.get('artist', 'Unknown Artist'),
@@ -118,48 +125,75 @@ def get_album_tracks(browse_id):
                 'id': t['videoId'],
                 'title': t['title']
             })
-        return tracks, album.get('title', 'Альбом')
+        album_thumb = fix_thumb_url(album.get('thumbnails', [{}])[-1].get('url'))
+        return tracks, album.get('title', 'Альбом'), album_thumb
     except Exception as e:
         logger.error(f"Ошибка получения альбома: {e}")
-        return [], None
+        return [], None, None
 
 def download_task(video_id, filename_prefix):
     """Скачивание и конвертация одного трека."""
     url = f"https://music.youtube.com/watch?v={video_id}"
     filename_base = os.path.join(TEMP_FOLDER, filename_prefix)
-    
-    ydl_opts = {
-        'format': 'bestaudio/best',
-        'outtmpl': f'{filename_base}.%(ext)s',
-        'noplaylist': True,
-        'quiet': True,
-        'extract_audio': True,
-        'postprocessors': [{
-            'key': 'FFmpegExtractAudio',
-            'preferredcodec': 'flac',
-            'preferredquality': '0',
-        }, {
-            'key': 'FFmpegMetadata',
-        }, {
-            'key': 'EmbedThumbnail',
-        }],
-        'writethumbnail': True,
-    }
 
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            final_filename = f"{filename_base}.flac"
-            
-            # Улучшенное получение метаданных
-            title = info.get('title', 'Unknown Track')
-            duration = info.get('duration', 0)
-            artist = info.get('artist') or info.get('uploader') or 'Unknown Artist'
-            
-            return final_filename, title, duration, artist
+        # 1. Получаем метаданные через yt-dlp (dump-json)
+        # Используем subprocess для вызова внешнего exe
+        cmd_info = ['yt-dlp', '--dump-json', '--no-playlist', url]
+        proc = subprocess.run(cmd_info, capture_output=True, text=True, encoding='utf-8', check=True)
+        info = json.loads(proc.stdout)
+        
+        title = info.get('title', 'Unknown Track')
+        duration = info.get('duration', 0)
+        artist = info.get('artist') or info.get('uploader') or 'Unknown Artist'
+
+        # 2. Скачиваем трек
+        cmd_dl = [
+            'yt-dlp',
+            '-f', 'ba[ext=m4a]/bestaudio',
+            '--embed-thumbnail',
+            '--add-metadata',
+            '--no-playlist',
+            '--no-cache-dir',
+            '--no-check-certificate',
+            '-o', f'{filename_base}.%(ext)s',
+            url
+        ]
+        
+        # Попытки скачивания (2 попытки)
+        success = False
+        last_err = ""
+        for attempt in range(2):
+            result = subprocess.run(cmd_dl, capture_output=True, text=True, encoding='utf-8')
+            if result.returncode == 0:
+                success = True
+                break
+            last_err = result.stderr
+            logger.warning(f"Попытка {attempt+1} для {video_id} не удалась. Ошибка: {last_err.strip()}")
+            if attempt == 0:
+                import time
+                time.sleep(2)
+
+        if not success:
+            logger.error(f"Не удалось скачать {video_id} после всех попыток. Причина: {last_err}")
+            return None, None, None, None, None, None
+
+        # Ищем, какой файл в итоге создался (m4a или fallback на webm/opus)
+        final_filename = None
+        for ext in ['m4a', 'webm', 'mp3', 'opus']:
+            p = f"{filename_base}.{ext}"
+            if os.path.exists(p):
+                final_filename = p
+                break
+        
+        if not final_filename:
+            return None, None, None, None, None, None
+
+        final_thumb_url = info.get('thumbnail')
+        return final_filename, title, duration, artist, None, final_thumb_url
     except Exception as e:
         logger.error(f"Download error: {e}")
-        return None, None, None, None
+        return None, None, None, None, None, None
 
 # --- ОБРАБОТЧИКИ ---
 
@@ -201,13 +235,18 @@ async def process_sub_artist(callback: CallbackQuery):
         
         subs = load_subs()
         if artist_id not in subs["artists"]:
-            last_id = None
+            last_single = None
             if artist_data.get('singles', {}).get('results'):
-                last_id = artist_data['singles']['results'][0]['videoId']
+                last_single = artist_data['singles']['results'][0]['videoId']
+            
+            last_album = None
+            if artist_data.get('albums', {}).get('results'):
+                last_album = artist_data['albums']['results'][0]['browseId']
             
             subs["artists"][artist_id] = {
                 "name": artist_name,
-                "last_release": last_id,
+                "last_single": last_single,
+                "last_album": last_album,
                 "subscribers": []
             }
 
@@ -310,27 +349,28 @@ async def check_artist_updates():
         for artist_id, data in subs["artists"].items():
             try:
                 artist_info = await loop.run_in_executor(executor, ytmusic.get_artist, artist_id)
-                singles = artist_info.get('singles', {}).get('results', [])
                 
+                # Проверка синглов (треков)
+                singles = artist_info.get('singles', {}).get('results', [])
                 if singles:
-                    latest_track = singles[0]
-                    if latest_track['videoId'] != data['last_release']:
-                        # Нашли новый трек!
-                        data['last_release'] = latest_track['videoId']
-                        logger.info(f"Новый релиз у {data['name']}: {latest_track['title']}")
+                    latest_s = singles[0]
+                    # Поддержка миграции со старого поля last_release
+                    old_s_id = data.get('last_single') or data.get('last_release')
+                    if latest_s['videoId'] != old_s_id:
+                        data['last_single'] = latest_s['videoId']
+                        data.pop('last_release', None) # Удаляем старый ключ
+                        await notify_subscribers(data['subscribers'], data['name'], latest_s['title'], "Трек")
                         changed = True
-                        
-                        notification = (
-                            f"🔔 **Новый релиз!**\n\n"
-                            f"Исполнитель: {data['name']}\n"
-                            f"Трек: {latest_track['title']}\n\n"
-                            f"Чтобы скачать, используйте поиск бота."
-                        )
-                        
-                        for user_id in data['subscribers']:
-                            try:
-                                await bot.send_message(user_id, notification, parse_mode="Markdown")
-                            except Exception: pass
+
+                # Проверка альбомов
+                albums = artist_info.get('albums', {}).get('results', [])
+                if albums:
+                    latest_a = albums[0]
+                    if latest_a['browseId'] != data.get('last_album'):
+                        data['last_album'] = latest_a['browseId']
+                        await notify_subscribers(data['subscribers'], data['name'], latest_a['title'], "Альбом")
+                        changed = True
+
             except Exception as e:
                 logger.error(f"Ошибка при проверке артиста {data['name']}: {e}")
 
@@ -340,17 +380,36 @@ async def check_artist_updates():
         # Проверяем раз в 12 часов
         await asyncio.sleep(12 * 3600)
 
+async def notify_subscribers(user_ids, artist_name, title, release_type):
+    """Вспомогательная функция для рассылки уведомлений."""
+    logger.info(f"Новый {release_type} у {artist_name}: {title}")
+    notification = (
+        f"🔔 **Новый {release_type}!**\n\n"
+        f"Исполнитель: {artist_name}\n"
+        f"Название: {title}\n\n"
+        f"Чтобы скачать, используйте поиск бота."
+    )
+    for user_id in user_ids:
+        try:
+            await bot.send_message(user_id, notification, parse_mode="Markdown")
+        except Exception:
+            pass
+
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     await message.answer(
-        "🎧 **YouTube Music FLAC Bot**\n\n"
-        "Я ищу музыку напрямую в базе YouTube Music (чистый звук, без клипов).\n\n"
-        "🔎 **Как пользоваться:**\n"
-        "1. Просто поиск трека: `@botname название`\n"
-        "2. Поиск альбома: `@botname alb название`\n"
-        "3. Поиск артиста: `@botname art имя`\n"
-        "4. Подписка на артиста: `/follow имя`\n"
-        "5. Список подписок: `/unfollow`"
+        "🎧 **YouTube Music M4A Bot**\n"
+        "Бот для поиска и скачивания музыки в высоком качестве.\n\n"
+        "🔎 **Поиск через команды (в личке):**\n"
+        "• `/song название` — поиск трека\n"
+        "• `/album название` — поиск альбома\n"
+        "• `/artist название` — поиск артиста\n\n"
+        "✨ **Inline-поиск (в любом чате):**\n"
+        "Просто начни писать `@имя_бота` и запрос.\n\n"
+        "🔔 **Подписки:**\n"
+        "• `/follow имя` — подписаться на новинки\n"
+        "• `/unfollow` — управление подписками",
+        parse_mode="Markdown"
     )
 
 @dp.inline_query()
@@ -404,6 +463,229 @@ async def inline_search(inline_query: types.InlineQuery):
 
     await inline_query.answer(articles, cache_time=60, is_personal=False)
 
+# --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ЗАГРУЗКИ ---
+
+async def handle_tr(message: types.Message, content_id: str):
+    status_msg = await message.reply("⏳ `YouTube Music`: Скачиваю трек в M4A...")
+    loop = asyncio.get_running_loop()
+    
+    file_path, title, duration, artist, thumb_path, thumb_url = await loop.run_in_executor(
+        executor, download_task, content_id, content_id
+    )
+    
+    if file_path and os.path.exists(file_path):
+        try:
+            if os.path.getsize(file_path) > 50 * 1024 * 1024:
+                await status_msg.edit_text("❌ Файл слишком велик (> 50MB). Telegram не позволяет ботам отправлять такие файлы.")
+                return
+
+            audio = FSInputFile(file_path)
+            
+            # Приоритет: локальный файл (лучше для Telegram), затем URL
+            thumb = None
+            if thumb_path and os.path.exists(thumb_path):
+                thumb = FSInputFile(thumb_path)
+            elif thumb_url:
+                thumb = URLInputFile(thumb_url)
+
+            await message.answer_audio(
+                audio, 
+                title=title, 
+                performer=artist,
+                duration=duration, 
+                thumbnail=thumb
+            )
+        finally:
+            if os.path.exists(file_path): os.remove(file_path)
+            if thumb_path and os.path.exists(thumb_path): os.remove(thumb_path)
+            await status_msg.delete()
+            if message.text and "#music_load" in message.text:
+                try: await message.delete()
+                except: pass
+    else:
+        await status_msg.edit_text("❌ Ошибка загрузки.")
+        await asyncio.sleep(3)
+        await status_msg.delete()
+        if message.text and "#music_load" in message.text:
+            try: await message.delete()
+            except: pass
+
+async def handle_al(message: types.Message, content_id: str):
+    status_msg = await message.reply("⏳ `YouTube Music`: Получаю список треков альбома...")
+    loop = asyncio.get_running_loop()
+    
+    tracks, album_title, album_thumb = await loop.run_in_executor(executor, get_album_tracks, content_id)
+    
+    if not tracks:
+        await status_msg.edit_text("❌ Не удалось получить информацию об альбоме.")
+        await asyncio.sleep(3)
+        await status_msg.delete()
+        if message.text and "#music_load" in message.text:
+            try: await message.delete()
+            except: pass
+        return
+
+    total = len(tracks)
+    await status_msg.edit_text(f"💿 Альбом: **{album_title}**\nТреков: {total}. Начинаю загрузку...")
+    
+    sem = asyncio.Semaphore(3)
+    downloaded_results = [None] * total # Сохраняем порядок треков
+
+    async def download_and_send(track_info, index):
+        async with sem:
+            file_prefix = f"{content_id}_{track_info['id']}"
+            res = await loop.run_in_executor(
+                executor, download_task, track_info['id'], file_prefix
+            )
+            downloaded_results[index] = res
+
+    tasks = [download_and_send(track, i) for i, track in enumerate(tracks)]
+    await asyncio.gather(*tasks)
+
+    # Отправка по одному треку (сохраняя порядок)
+    for res in downloaded_results:
+        if res and res[0]:
+            path, title, duration, artist, thumb_path, thumb_url = res
+            
+            if os.path.getsize(path) > 50 * 1024 * 1024:
+                logger.warning(f"Файл {title} слишком велик (> 50MB) и будет пропущен.")
+            else:
+                try:
+                    thumb = None
+                    if thumb_path and os.path.exists(thumb_path):
+                        thumb = FSInputFile(thumb_path)
+                    elif thumb_url:
+                        thumb = URLInputFile(thumb_url)
+                    elif album_thumb:
+                        thumb = URLInputFile(album_thumb)
+
+                    await message.answer_audio(
+                        FSInputFile(path),
+                        title=title,
+                        performer=artist,
+                        duration=duration,
+                        thumbnail=thumb
+                    )
+                except Exception as e:
+                    logger.error(f"Error sending {title}: {e}")
+            
+            # Очистка
+            if os.path.exists(path): os.remove(path)
+            if thumb_path and os.path.exists(thumb_path): os.remove(thumb_path)
+            await asyncio.sleep(0.5) # Небольшая пауза между отправками
+
+    await status_msg.delete()
+    if message.text and "#music_load" in message.text:
+        try: await message.delete()
+        except: pass
+
+async def handle_ar(message: types.Message, content_id: str, artist_name: str = None):
+    if not artist_name:
+        loop = asyncio.get_running_loop()
+        artist_data = await loop.run_in_executor(executor, ytmusic.get_artist, content_id)
+        artist_name = artist_data.get('name', 'Артист')
+        
+    keyboard = [[InlineKeyboardButton(text=f"Подписаться на {artist_name}", callback_data=f"sub_artist:{content_id}")]]
+    markup = InlineKeyboardMarkup(inline_keyboard=keyboard)
+    
+    await message.reply(f"👤 Это профиль артиста **{artist_name}**. Хотите подписаться на уведомления о новых треках?", 
+                        reply_markup=markup, parse_mode="Markdown")
+    if message.text and "#music_load" in message.text:
+        try: await message.delete()
+        except: pass
+
+# --- ОБРАБОТЧИКИ ПОИСКА ЧЕРЕЗ КОМАНДЫ ---
+
+# --- ПАГИНАЦИЯ ПОИСКА ---
+
+def generate_search_markup(results, query, stype, page):
+    """Генерирует клавиатуру для результатов поиска с пагинацией."""
+    items_per_page = 5
+    start = page * items_per_page
+    end = start + items_per_page
+    current_items = results[start:end]
+    
+    keyboard = []
+    for item in current_items:
+        btn_text = f"{item['title']} ({item['subtitle']})"
+        if len(btn_text) > 50: btn_text = btn_text[:47] + "..."
+            
+        keyboard.append([InlineKeyboardButton(
+            text=btn_text, 
+            callback_data=f"select_{item['type']}:{item['id']}"
+        )])
+    
+    nav_row = []
+    # Ограничиваем длину запроса для callback_data (лимит 64 байта)
+    safe_query = query[:40]
+    
+    if page > 0:
+        nav_row.append(InlineKeyboardButton(text="⬅️ Назад", callback_data=f"sp:{stype}:{page-1}:{safe_query}"))
+    if end < len(results):
+        nav_row.append(InlineKeyboardButton(text="Вперед ➡️", callback_data=f"sp:{stype}:{page+1}:{safe_query}"))
+    
+    if nav_row:
+        keyboard.append(nav_row)
+    
+    return InlineKeyboardMarkup(inline_keyboard=keyboard)
+
+@dp.callback_query(F.data.startswith("sp:"))
+async def process_search_pagination(callback: CallbackQuery):
+    parts = callback.data.split(":")
+    stype = parts[1]
+    page = int(parts[2])
+    query = ":".join(parts[3:])
+    
+    loop = asyncio.get_running_loop()
+    results = await loop.run_in_executor(executor, search_ytmusic, query, stype)
+    
+    if not results:
+        await callback.answer("Ничего не найдено.")
+        return
+
+    markup = generate_search_markup(results, query, stype, page)
+    try:
+        await callback.message.edit_reply_markup(reply_markup=markup)
+    except Exception:
+        pass
+    await callback.answer()
+
+@dp.message(Command("song", "album", "artist"))
+async def cmd_search(message: types.Message, command: Command):
+    query = command.args
+    cmd = command.command.lower()
+    
+    if not query:
+        hints = {"song": "трека", "album": "альбома", "artist": "артиста"}
+        await message.answer(f"Введите название {hints.get(cmd)}: `/{cmd} Название`", parse_mode="Markdown")
+        return
+
+    search_types = {"song": "songs", "album": "albums", "artist": "artists"}
+    stype = search_types[cmd]
+    
+    loop = asyncio.get_running_loop()
+    results = await loop.run_in_executor(executor, search_ytmusic, query, stype)
+    
+    if not results:
+        await message.answer("Ничего не найдено.")
+        return
+
+    markup = generate_search_markup(results, query, stype, 0)
+    await message.answer(f"🔍 Результаты поиска {cmd}:", reply_markup=markup)
+
+@dp.callback_query(F.data.startswith("select_"))
+async def process_select_callback(callback: CallbackQuery):
+    parts = callback.data.split(":")
+    ctype = parts[0].split("_")[1]
+    cid = parts[1]
+    await callback.answer()
+    if ctype == "TR":
+        await handle_tr(callback.message, cid)
+    elif ctype == "AL":
+        await handle_al(callback.message, cid)
+    elif ctype == "AR":
+        await handle_ar(callback.message, cid)
+
 @dp.message(F.text.contains("#music_load"))
 async def process_download(message: types.Message):
     # Парсинг данных из сообщения
@@ -415,95 +697,31 @@ async def process_download(message: types.Message):
     content_id = id_match.group(1)
     content_type = type_match.group(1)
     
-    # === ВАРИАНТ 1: ОДИНОЧНЫЙ ТРЕК ===
     if content_type == "TR":
-        status_msg = await message.reply("⏳ `YouTube Music`: Скачиваю трек во FLAC...")
-        loop = asyncio.get_running_loop()
-        
-        file_path, title, duration, artist = await loop.run_in_executor(
-            executor, download_task, content_id, content_id
-        )
-        
-        if file_path and os.path.exists(file_path):
-            try:
-                audio = FSInputFile(file_path)
-                await message.reply_audio(
-                    audio, 
-                    title=title, 
-                    performer=artist, # Теперь у нас есть чистый исполнитель
-                    duration=duration, 
-                    caption="💾 Format: `FLAC`"
-                )
-            finally:
-                if os.path.exists(file_path): os.remove(file_path)
-                await status_msg.delete()
-        else:
-            await status_msg.edit_text("❌ Ошибка загрузки.")
-
-    # === ВАРИАНТ 3: АРТИСТ (ПОДПИСКА) ===
+        await handle_tr(message, content_id)
     elif content_type == "AR":
-        # Вместо скачивания предлагаем подписаться
         name_match = re.search(r"Выбрано: (.*)\.\.\.", message.text)
-        artist_name = name_match.group(1) if name_match else "Артист"
-        
-        keyboard = [[InlineKeyboardButton(text=f"Подписаться на {artist_name}", callback_data=f"sub_artist:{content_id}")]]
-        markup = InlineKeyboardMarkup(inline_keyboard=keyboard)
-        
-        await message.reply(f"👤 Это профиль артиста **{artist_name}**. Хотите подписаться на уведомления о новых треках?", 
-                            reply_markup=markup, parse_mode="Markdown")
-
-    # === ВАРИАНТ 2: АЛЬБОМ ===
+        artist_name = name_match.group(1) if name_match else None
+        await handle_ar(message, content_id, artist_name)
     elif content_type == "AL":
-        status_msg = await message.reply("⏳ `YouTube Music`: Получаю список треков альбома...")
-        loop = asyncio.get_running_loop()
-        
-        # 1. Получаем треки через API (мгновенно)
-        tracks, album_title = await loop.run_in_executor(executor, get_album_tracks, content_id)
-        
-        if not tracks:
-            await status_msg.edit_text("❌ Не удалось получить информацию об альбоме.")
-            return
+        await handle_al(message, content_id)
 
-        total = len(tracks)
-        await status_msg.edit_text(f"💿 Альбом: **{album_title}**\nТреков: {total}. Начинаю загрузку...")
-        
-        # 2. Параллельная загрузка с ограничением (Semaphore)
-        sem = asyncio.Semaphore(3) # Качаем по 3 трека одновременно
-
-        async def download_and_send(track_info, index):
-            async with sem:
-                file_prefix = f"{content_id}_{track_info['id']}"
-                file_path, title, duration, artist = await loop.run_in_executor(
-                    executor, download_task, track_info['id'], file_prefix
-                )
-                
-                if file_path and os.path.exists(file_path):
-                    try:
-                        audio = FSInputFile(file_path)
-                        await message.reply_audio(
-                            audio,
-                            title=title,
-                            performer=artist,
-                            duration=duration,
-                            caption=f"💿 {index}/{total}"
-                        )
-                    except Exception as e:
-                        logger.error(f"Error sending {title}: {e}")
-                    finally:
-                        if os.path.exists(file_path): os.remove(file_path)
-                
-                # Небольшая пауза, чтобы Telegram не забанил за флуд сообщениями
-                await asyncio.sleep(1)
-
-        # Запускаем задачи
-        tasks = [download_and_send(track, i) for i, track in enumerate(tracks, 1)]
-        await asyncio.gather(*tasks)
-        
-        await status_msg.edit_text("✅ Альбом загружен.")
+# --- НАСТРОЙКА МЕНЮ КОМАНД ---
+async def set_main_menu(bot: Bot):
+    main_menu_commands = [
+        BotCommand(command="song", description="🔍 Поиск трека"),
+        BotCommand(command="album", description="💿 Поиск альбома"),
+        BotCommand(command="artist", description="👤 Поиск артиста"),
+        BotCommand(command="follow", description="🔔 Подписаться"),
+        BotCommand(command="unfollow", description="🔕 Отписаться"),
+        BotCommand(command="start", description="📖 Инструкция")
+    ]
+    await bot.set_my_commands(main_menu_commands)
 
 # --- ЗАПУСК ---
 async def main():
     await bot.delete_webhook(drop_pending_updates=True)
+    await set_main_menu(bot)
     asyncio.create_task(check_artist_updates())
     await dp.start_polling(bot)
 
