@@ -60,10 +60,33 @@ def fix_thumb_url(url):
 
 def search_ytmusic(query, search_type='songs'):
     """
-    Ищет треки или альбомы через YouTube Music API.
-    search_type: 'songs' или 'albums'
+    Ищет контент через YouTube Music API или напрямую в YouTube.
     """
     try:
+        # Если ищем видео, используем yt-dlp для поиска по всему YouTube
+        if search_type == 'videos':
+            cmd = [
+                'yt-dlp', 
+                '--dump-json', 
+                '--flat-playlist', 
+                '--no-playlist', 
+                f'ytsearch15:{query}'
+            ]
+            proc = subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8')
+            parsed_results = []
+            for line in proc.stdout.splitlines():
+                try:
+                    item = json.loads(line)
+                    parsed_results.append({
+                        'id': item['id'],
+                        'title': item['title'],
+                        'subtitle': f"YouTube • {item.get('uploader', 'Unknown')}",
+                        'thumb': fix_thumb_url(item.get('thumbnail')),
+                        'type': 'VI'
+                    })
+                except: continue
+            return parsed_results
+
         # filter может быть: songs, videos, albums, artists, playlists
         results = ytmusic.search(query, filter=search_type, limit=20)
         parsed_results = []
@@ -404,6 +427,7 @@ async def cmd_start(message: types.Message):
         "• `/song название` — поиск трека\n"
         "• `/album название` — поиск альбома\n"
         "• `/artist название` — поиск артиста\n\n"
+        "• `/video название` — поиск видео\n\n"
         "✨ **Inline-поиск (в любом чате):**\n"
         "Просто начни писать `@имя_бота` и запрос.\n\n"
         "🔔 **Подписки:**\n"
@@ -421,6 +445,7 @@ async def inline_search(inline_query: types.InlineQuery):
     # Определение режима: Альбом, Артист или Трек
     is_album = False
     is_artist = False
+    is_video = False
     clean_query = text
     if text.lower().startswith(('alb ', 'альбом ', 'album ')):
         is_album = True
@@ -429,6 +454,9 @@ async def inline_search(inline_query: types.InlineQuery):
     elif text.lower().startswith(('art ', 'artist ', 'артист ')):
         is_artist = True
         clean_query = " ".join(text.split()[1:])
+    elif text.lower().startswith(('vid ', 'video ', 'видео ')):
+        is_video = True
+        clean_query = " ".join(text.split()[1:])
 
     if not clean_query: return
 
@@ -436,6 +464,8 @@ async def inline_search(inline_query: types.InlineQuery):
         search_type = 'albums'
     elif is_artist:
         search_type = 'artists'
+    elif is_video:
+        search_type = 'videos'
     else:
         search_type = 'songs'
     
@@ -482,6 +512,50 @@ async def handle_tr(message: types.Message, content_id: str):
             audio = FSInputFile(file_path)
             
             # Приоритет: локальный файл (лучше для Telegram), затем URL
+            thumb = None
+            if thumb_path and os.path.exists(thumb_path):
+                thumb = FSInputFile(thumb_path)
+            elif thumb_url:
+                thumb = URLInputFile(thumb_url)
+
+            await message.answer_audio(
+                audio, 
+                title=title, 
+                performer=artist,
+                duration=duration, 
+                thumbnail=thumb
+            )
+        finally:
+            if os.path.exists(file_path): os.remove(file_path)
+            if thumb_path and os.path.exists(thumb_path): os.remove(thumb_path)
+            await status_msg.delete()
+            if message.text and "#music_load" in message.text:
+                try: await message.delete()
+                except: pass
+    else:
+        await status_msg.edit_text("❌ Ошибка загрузки.")
+        await asyncio.sleep(3)
+        await status_msg.delete()
+        if message.text and "#music_load" in message.text:
+            try: await message.delete()
+            except: pass
+
+async def handle_vi(message: types.Message, content_id: str):
+    status_msg = await message.reply("⏳ `YouTube`: Скачиваю аудио из видео...")
+    loop = asyncio.get_running_loop()
+    
+    file_path, title, duration, artist, thumb_path, thumb_url = await loop.run_in_executor(
+        executor, download_task, content_id, content_id
+    )
+    
+    if file_path and os.path.exists(file_path):
+        try:
+            if os.path.getsize(file_path) > 50 * 1024 * 1024:
+                await status_msg.edit_text("❌ Файл слишком велик (> 50MB). Telegram не позволяет ботам отправлять такие файлы.")
+                return
+
+            audio = FSInputFile(file_path)
+            
             thumb = None
             if thumb_path and os.path.exists(thumb_path):
                 thumb = FSInputFile(thumb_path)
@@ -650,17 +724,17 @@ async def process_search_pagination(callback: CallbackQuery):
         pass
     await callback.answer()
 
-@dp.message(Command("song", "album", "artist"))
+@dp.message(Command("song", "album", "artist", "video"))
 async def cmd_search(message: types.Message, command: Command):
     query = command.args
     cmd = command.command.lower()
     
     if not query:
-        hints = {"song": "трека", "album": "альбома", "artist": "артиста"}
+        hints = {"song": "трека", "album": "альбома", "artist": "артиста", "video": "видео"}
         await message.answer(f"Введите название {hints.get(cmd)}: `/{cmd} Название`", parse_mode="Markdown")
         return
 
-    search_types = {"song": "songs", "album": "albums", "artist": "artists"}
+    search_types = {"song": "songs", "album": "albums", "artist": "artists", "video": "videos"}
     stype = search_types[cmd]
     
     loop = asyncio.get_running_loop()
@@ -685,6 +759,8 @@ async def process_select_callback(callback: CallbackQuery):
         await handle_al(callback.message, cid)
     elif ctype == "AR":
         await handle_ar(callback.message, cid)
+    elif ctype == "VI":
+        await handle_vi(callback.message, cid)
 
 @dp.message(F.text.contains("#music_load"))
 async def process_download(message: types.Message):
@@ -705,6 +781,8 @@ async def process_download(message: types.Message):
         await handle_ar(message, content_id, artist_name)
     elif content_type == "AL":
         await handle_al(message, content_id)
+    elif content_type == "VI":
+        await handle_vi(message, content_id)
 
 # --- НАСТРОЙКА МЕНЮ КОМАНД ---
 async def set_main_menu(bot: Bot):
@@ -712,6 +790,7 @@ async def set_main_menu(bot: Bot):
         BotCommand(command="song", description="🔍 Поиск трека"),
         BotCommand(command="album", description="💿 Поиск альбома"),
         BotCommand(command="artist", description="👤 Поиск артиста"),
+        BotCommand(command="video", description="🎬 Поиск видео"),
         BotCommand(command="follow", description="🔔 Подписаться"),
         BotCommand(command="unfollow", description="🔕 Отписаться"),
         BotCommand(command="start", description="📖 Инструкция")
